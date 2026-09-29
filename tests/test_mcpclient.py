@@ -8,6 +8,7 @@ code paths as a deployment without needing a socket.
 import asyncio
 import contextlib
 import json
+from dataclasses import replace
 
 import pytest
 from conftest import make_settings, sign_in
@@ -20,7 +21,7 @@ from cra.app.web import route_chat
 from cra.app.web.factory import create_app
 from cra.assistant.mcpclient.host import RemoteHost
 from cra.assistant.mcpclient.pool import RemotePool
-from cra.core.connectors.sources import Source
+from cra.core.connectors.sources import Source, configured
 from cra.core.tools.tiers import Tier
 
 SESSION = "session-1"
@@ -395,3 +396,83 @@ async def test_without_a_key_nothing_is_stored(connected_app, client):
     repo = connected_app.extensions["cra"].repo
     user_id = (await repo.get_credential_by_username("alice")).user_id
     assert await repo.source_connections_of(user_id) == []
+
+# ── a key the deployment holds for everybody ────────────────────────────────
+
+SHARED = replace(ELAB, shared_token="good")
+
+
+def make_shared_host(toy: Toy) -> RemoteHost:
+    return RemoteHost({"elab": SHARED}, RemotePool(600.0, toy.transport))
+
+
+@pytest.fixture
+async def shared_app(tmp_path, toy):
+    """An app whose one source carries a key this deployment holds itself."""
+    settings = make_settings(
+        tmp_path,
+        mcp_elab_url=ELAB.url,
+        mcp_elab_register_url=ELAB.register_url,
+        mcp_elab_base_url=ELAB.default_base_url,
+    )
+    app = create_app(settings)
+    async with app.test_app():
+        app.extensions["cra"].remote = make_shared_host(toy)
+        yield app
+        await app.extensions["cra"].remote.aclose()
+
+
+async def test_a_shared_key_connects_without_a_registration(shared_app):
+    """Nobody pastes anything: the source is there on the first request."""
+    client = await sign_in(shared_app, shared_app.test_client())
+    assert await elab_status(client) == {"active": True, "tools": 2}
+
+
+async def test_a_shared_key_never_reaches_the_browser(shared_app):
+    client = await sign_in(shared_app, shared_app.test_client())
+    config = await (await client.get("/api/config")).get_json()
+    assert config["sources"]["elab"]["label"] == "eLabFTW"
+    assert "shared_token" not in config["sources"]["elab"]
+    assert "good" not in json.dumps(config)
+    session = await (await client.get("/api/session")).get_json()
+    assert "good" not in json.dumps(session)
+
+
+async def test_a_shared_key_unlocks_only_the_read_only_tools(shared_app):
+    """The toy offers three tools; the one that writes is withheld."""
+    client = await sign_in(shared_app, shared_app.test_client())
+    session = await (await client.get("/api/session")).get_json()
+    assert session["tools"]["elab"] == 2
+
+
+async def test_an_account_that_registers_its_own_key_keeps_it(shared_app):
+    """The shared key fills the gap; it never replaces what a person brought."""
+    client = await sign_in(shared_app, shared_app.test_client())
+    assert (await elab_status(client))["active"] is True
+    await client.post("/api/session/connect/elab", json={"token": "good"})
+    assert (await elab_status(client)) == {"active": True, "tools": 2}
+    await client.delete("/api/session/connect/elab")
+    assert (await elab_status(client))["active"] is False
+
+
+async def test_a_source_without_a_shared_key_stays_opt_in(connected_app, client):
+    session = await (await client.get("/api/session")).get_json()
+    assert session["connected"]["elab"]["active"] is False
+
+
+def test_the_shared_key_comes_from_the_settings(tmp_path):
+    settings = make_settings(
+        tmp_path,
+        mcp_nomad_url="https://nm.invalid/nm/mcp",
+        mcp_nomad_register_url="https://nm.invalid/nm/register",
+        mcp_nomad_base_url="https://oasis.invalid/nomad-oasis/api/v1",
+        mcp_nomad_token="s3cret",
+    )
+    source = configured(settings)["nomad"]
+    assert (source.label, source.prefix) == ("NOMAD", "nomad_")
+    assert source.shared_token == "s3cret"
+    assert "s3cret" not in json.dumps(source.public())
+
+
+def test_a_source_without_a_url_is_not_offered(tmp_path):
+    assert "nomad" not in configured(make_settings(tmp_path))
